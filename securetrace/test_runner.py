@@ -22,6 +22,7 @@ import xml.etree.ElementTree as ET
 
 from .ledger import get_requirement_detail, list_requirement_tests, record_test_check
 from .freshness import fingerprint_source_state
+from .adapters import get_adapter
 
 DEFAULT_TIMEOUT_SECONDS = 60
 MAX_TIMEOUT_SECONDS = 600
@@ -240,39 +241,8 @@ def sanitize_output(value: str) -> str:
 
 
 def validate_test_target(root: Path, test_file: str, test_id: str) -> tuple[Path, str]:
-    """Resolve a test file and pytest function strictly beneath approved dirs."""
-    root = root.expanduser().resolve(strict=True)
-    if not root.is_dir() or not (root / "pyproject.toml").is_file():
-        raise ValueError("Project root must be a directory containing pyproject.toml")
-    if not isinstance(test_file, str) or not test_file.strip():
-        raise ValueError("Test path is required")
-    raw = test_file.strip().replace("\\", "/")
-    path = PurePosixPath(raw)
-    if path.is_absolute() or re.match(r"^[A-Za-z]:", raw) or ".." in path.parts:
-        raise ValueError("Test path must be a safe project-relative path")
-    if path.suffix != ".py":
-        raise ValueError("Only Python test files can be run")
-    parts = path.parts
-    under_tests = len(parts) >= 2 and parts[0] == "tests"
-    under_example_tests = len(parts) >= 4 and parts[0] == "examples" and parts[2] == "tests"
-    if not (under_tests or under_example_tests):
-        raise ValueError("Tests must be under tests/ or examples/<sample>/tests/")
-    if not isinstance(test_id, str) or not _TEST_ID.fullmatch(test_id):
-        raise ValueError("Test identifier must name one test function (test_name)")
-    resolved = (root.joinpath(*parts)).resolve(strict=True)
-    try:
-        resolved.relative_to(root)
-    except ValueError as exc:
-        raise ValueError("Test path resolves outside the project root") from exc
-    try:
-        rel = resolved.relative_to(root).parts
-    except ValueError as exc:
-        raise ValueError("Test path resolves outside the project root") from exc
-    if not (rel[0] == "tests" or (rel[0] == "examples" and "tests" in rel[2:])):
-        raise ValueError("Resolved test path is outside an approved test directory")
-    if not resolved.is_file():
-        raise ValueError("Test path must be a file")
-    return resolved, str(test_id)
+    """Resolve a test file and test function strictly beneath approved dirs."""
+    return get_adapter(root).validate_target(root, test_file, test_id)
 
 
 def _drain(pipe: BinaryIO, capture: list[bytes], limit: int, truncated: list[bool]) -> None:
@@ -391,18 +361,9 @@ def run_approved_test(
     try:
         evidence_dir = root / ".securetrace" / "evidence"
         evidence_dir.mkdir(parents=True, exist_ok=True)
-        fd, junit_name = tempfile.mkstemp(prefix=".pytest-", suffix=".xml", dir=evidence_dir)
-        os.close(fd)
-        junit_path = Path(junit_name)
-        config_fd, config_name = tempfile.mkstemp(prefix=".pytest-config-", suffix=".ini", dir=evidence_dir)
-        os.close(config_fd)
-        config_path = Path(config_name)
-        config_path.write_text("[pytest]\n", encoding="utf-8")
-        argv = [
-            sys.executable, "-m", "pytest", "-q", "-s", "--tb=short", "--disable-warnings",
-            "--maxfail=1", f"--confcutdir={resolved_file.parent}", f"--rootdir={root}",
-            "-c", str(config_path), f"--junitxml={junit_path}", test_node,
-        ]
+        adapter = get_adapter(root)
+        junit_path, config_path = adapter.prepare_execution_artifacts(evidence_dir)
+        argv = adapter.build_command(root, resolved_file, test_id, junit_path, config_path)
         popen_options: dict = {}
         if os.name == "nt":
             popen_options["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -422,26 +383,7 @@ def run_approved_test(
         reader.start()
         try:
             exit_code = process.wait(timeout=timeout_value)
-            outcome = "PASSED" if exit_code == 0 else "ERROR"
-            if exit_code == 1:
-                # JUnit output distinguishes assertion failures from test or
-                # collection errors; only an assertion is a security failure.
-                try:
-                    root_element = ET.parse(junit_path).getroot()
-                    cases = root_element.findall(".//testcase")
-                    failures = [case.find("failure") for case in cases]
-                    if cases and any(
-                        failure is not None
-                        and (
-                            failure.get("type", "").rsplit(".", 1)[-1] == "AssertionError"
-                            or failure.get("message", "").startswith("AssertionError")
-                            or failure.get("message", "").lstrip().startswith("assert ")
-                        )
-                        for failure in failures
-                    ):
-                        outcome = "FAILED"
-                except (OSError, ET.ParseError):
-                    outcome = "ERROR"
+            outcome = adapter.parse_exit_outcome(exit_code, junit_path)
         except subprocess.TimeoutExpired:
             exit_code, process_tree_cleanup_succeeded = _terminate_process_tree(process)
             outcome = "TIMEOUT"
