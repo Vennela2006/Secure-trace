@@ -21,3 +21,6 @@ __pycache__/
 .pytest-tmp/
 .test-temp/
 .gemini/
+
+# Local backup files
+*.bak
